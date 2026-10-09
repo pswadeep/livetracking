@@ -2,7 +2,6 @@ name: NSE Telegram Alerts
 
 on:
   schedule:
-    # NSE hours 09:15-15:30 IST = 03:45-10:00 UTC, Mon-Fri, every 5 min
     - cron: "45,50,55 3 * * 1-5"
     - cron: "*/5 4-9 * * 1-5"
     - cron: "0 10 * * 1-5"
@@ -24,8 +23,20 @@ jobs:
   alert:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check secrets are available
+        run: |
+          if [ -z "$N8N_WEBHOOK_URL" ] && { [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; }; then
+            echo "::error::Secrets missing. Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID under Settings > Secrets and variables > Actions > Repository secrets"
+            exit 1
+          fi
+          echo "Secrets found."
 
       - uses: actions/setup-python@v5
         with:
@@ -34,7 +45,6 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # previous run's OI snapshot -> lets the message show "before vs now"
       - name: Restore previous snapshot
         uses: actions/cache/restore@v4
         with:
@@ -43,10 +53,6 @@ jobs:
           restore-keys: nse-snapshot-
 
       - name: Run engine and send Telegram message
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
         run: python nse_telegram.py ${{ github.event.inputs.force == 'true' && '--force' || '' }}
 
       - name: Save snapshot for next run
