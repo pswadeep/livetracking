@@ -1,142 +1,207 @@
 #!/usr/bin/env python3
 """
-NSE -> Telegram reporter (headless, built for GitHub Actions every 5 min).
-Needs nse_engine.py (your existing file) in the same folder.
+NSE Support/Resistance Confluence Engine  (personal use)
 
-What gets sent
-  1. ONE ALBUM of 3 chart images (NIFTY, BANKNIFTY, SENSEX) - last 3 sessions, 15m candles, with
-     resistance / support zones (call / put OI walls), trendlines, PDH/PDL and spot drawn on the chart.
-     Each image carries a compact caption: value, bias, PDH/PDL/PWH/PWL, Fibonacci, EMA, R/S strikes.
-  2. ONE TEXT MESSAGE with the OI change (before vs now): strike table, wall changes, totals,
-     a collapsible "what it means" reading, and link buttons.
+Data   : NSE option chain (cookie-warmed session, v3 endpoint -> legacy fallback)
+         Yahoo Finance candles for ^NSEI / ^NSEBANK (daily, 15m, 5m)
+Methods: swings + trendlines, anchored VWAP, OI / change-in-OI / PCR / max pain,
+         standard pivots, Camarilla, Fibonacci, EMA 20/50/200, volume profile
+         (TPO fallback when index volume is 0), Gann Square of 9
+Output : confluence zones scored out of 14 + live signals, served as JSON to index.html
 
-Delivery
-  Photos : always direct to Telegram (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)
-  Text   : N8N_WEBHOOK_URL if set (n8n forwards to Telegram), otherwise direct
-
-Usage
-  python nse_telegram.py             # only 09:15-15:30 IST Mon-Fri
-  python nse_telegram.py --force     # ignore market hours
-  python nse_telegram.py --dry-run   # print text, save charts to ./charts, send nothing
+Run    : pip install requests numpy
+         python nse_engine.py            -> http://127.0.0.1:8000
+         python nse_engine.py --once     -> one text report in the terminal
 """
-import argparse
-import datetime as dt
-import html
-import io
-import json
-import os
-import re
-import sys
-import time
+import datetime as dt, json, math, sys, threading, time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import quote
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import requests
 
-from nse_engine import IST, NSE, analyse_chain, ema, market_open, swings, yf
-
-STATE = Path(os.getenv("STATE_FILE", "state/snapshot.json"))
-YF_SYM = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "SENSEX": "^BSESN"}
-HAS_CHAIN = ("NIFTY", "BANKNIFTY")   # Sensex options are on BSE, not NSE
-TV = {"NIFTY": "NSE%3ANIFTY", "BANKNIFTY": "NSE%3ABANKNIFTY", "SENSEX": "BSE%3ASENSEX"}
-STALE_AFTER = 20 * 60
-MAX_MSG = 3900
-BIAS_ICON = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}
-
-# chart palette
-BG, UP, DN = "#F4F7FB", "#1B8A4B", "#D64545"
-RED, GREEN, BLUE, PURPLE, INK = "#D64545", "#1B8A4B", "#1F5FBF", "#7A3FB5", "#14213D"
-
-
-# ----------------------------------------------------------------- formatting
-def n0(x):
-    return f"{x:,.0f}"
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+BASE = "https://www.nseindia.com"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+SYMS = {  # tol = zone width as fraction of spot, bin = volume-profile bucket (points)
+    "NIFTY":     dict(yf="^NSEI",   tol=0.0012, bin=10),
+    "BANKNIFTY": dict(yf="^NSEBANK", tol=0.0012, bin=25),
+}
+# confluence weights (distinct method per zone, each counted once) -> max 14
+W = dict(swing=1, trend3=2, trend2=1, avwap=2, oi=2, oichg=1, pcr=1, pivot=1, fib=1, ema=1, vp=2)
+MAX_SCORE = 14
+GRADES = [(14, "Extreme"), (11, "Very strong"), (8, "Strong"), (5, "Moderate"), (0, "Weak")]
+OPEN_REFRESH, CLOSED_REFRESH = 180, 900
 
 
-def lk(x):
-    return f"{x / 1e5:.1f}L"
+def market_open(now=None):
+    n = now or dt.datetime.now(IST)
+    return n.weekday() < 5 and dt.time(9, 15) <= n.time() <= dt.time(15, 30)
 
 
-def kd(x):
-    return "—" if x is None else f"{x / 1e3:+.1f}k"
+def grade(s):
+    return next(g for t, g in GRADES if s >= t)
 
 
-def pct(a, b):
-    return (a - b) / b * 100 if b else 0.0
+def clean(o):  # JSON-safe: numpy -> python, NaN/inf -> None
+    if isinstance(o, dict):
+        return {k: clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [clean(v) for v in o]
+    if isinstance(o, np.generic):
+        o = o.item()
+    if isinstance(o, float) and not math.isfinite(o):
+        return None
+    return o
 
 
-def arrow(chg):
-    return f"{'🟢▲' if chg >= 0 else '🔴▼'}{abs(chg):.2f}%"
+# --------------------------------------------------------------------- NSE scraper
+class NSE:
+    H = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*",
+         "Accept-Language": "en-US,en;q=0.9", "Accept-Encoding": "gzip, deflate",
+         "Referer": BASE + "/option-chain"}
+
+    def __init__(self):
+        self.s, self.t = None, 0.0
+
+    def _sess(self, force=False):
+        if force or self.s is None or time.time() - self.t > 240:
+            self.s = requests.Session()
+            self.s.headers.update(self.H)
+            self.s.get(BASE + "/option-chain", timeout=10)  # cookie warm-up
+            self.t = time.time()
+        return self.s
+
+    def get(self, path, **params):
+        err = None
+        for a in range(3):
+            try:
+                r = self._sess(force=a > 0).get(BASE + path, params=params, timeout=12)
+                if r.status_code == 200 and r.text.lstrip()[:1] in "{[":
+                    return r.json()
+                err = f"HTTP {r.status_code}"
+            except Exception as e:  # network / cookie problems -> rebuild session
+                err = str(e)
+            time.sleep(1.5 * (a + 1))
+        raise RuntimeError(f"NSE {path}: {err}")
+
+    def chain(self, sym):
+        try:  # newer endpoint needs an explicit expiry
+            ex = self.get("/api/option-chain-contract-info", symbol=sym)["expiryDates"][0]
+            j = self.get("/api/option-chain-v3", type="Indices", symbol=sym, expiry=ex)
+            if j.get("records", {}).get("data"):
+                return j
+        except Exception:
+            pass
+        return self.get("/api/option-chain-indices", symbol=sym)
 
 
-# ----------------------------------------------------------------- daily levels
-def daily_levels(d):
-    """PDH/PDL/PWH/PWL, Fibonacci, EMA 20/50/200 - same logic as nse_engine.build()."""
-    today = dt.datetime.now(IST).date()
-    last_today = dt.datetime.fromtimestamp(d["t"][-1], IST).date() == today
-    i = -2 if market_open() and last_today else -1
-    n = len(d["c"]) + i + 1
-    lv = dict(
-        PDH=float(d["h"][i]), PDL=float(d["l"][i]),
-        PWH=float(d["h"][max(0, n - 5):n].max()), PWL=float(d["l"][max(0, n - 5):n].min()),
-        live=float(d["c"][-1]),
-        prev_close=float(d["c"][-2] if last_today and len(d["c"]) > 1 else d["c"][-1]),
-    )
-    h, l = d["h"][-120:], d["l"][-120:]
-    ih, il = swings(h, l, 5)
-    fib = {}
-    if len(ih) and len(il):
-        fh, fl = h[ih[-1]], l[il[-1]]
-        for r in (0.382, 0.5, 0.618):
-            fib[f"{r * 100:g}"] = float(fh - (fh - fl) * r if il[-1] < ih[-1] else fl + (fh - fl) * r)
-    lv["fib"] = fib
-    lv["ema"] = {k: float(ema(d["c"], k)[-1]) for k in (20, 50, 200)}
-    return lv
+# --------------------------------------------------------------------- price data
+def yf(sym, interval, rng):
+    r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/" + quote(sym),
+                     params=dict(interval=interval, range=rng), headers={"User-Agent": UA}, timeout=12)
+    j = r.json()["chart"]["result"][0]
+    q = j["indicators"]["quote"][0]
+    a = {k: np.array(q[k], dtype=float) for k in ("open", "high", "low", "close", "volume")}
+    t = np.array(j["timestamp"], dtype=float)
+    ok = np.isfinite(a["close"]) & np.isfinite(a["high"]) & np.isfinite(a["low"])
+    return dict(t=t[ok], o=a["open"][ok], h=a["high"][ok], l=a["low"][ok], c=a["close"][ok],
+                v=np.nan_to_num(a["volume"][ok]))
 
 
-def last_days(b, n=3):
-    """Keep only the last n trading sessions of an intraday series."""
-    day = np.array([dt.datetime.fromtimestamp(t, IST).date().toordinal() for t in b["t"]])
-    keep = sorted(set(day.tolist()))[-n:]
-    m = np.isin(day, keep)
-    out = {k: v[m] for k, v in b.items()}
-    out["day"] = day[m]
-    return out
+def load_prices(cfg, old=None):
+    """Daily refreshed hourly, intraday every 2 min."""
+    old, now = old or {}, time.time()
+    px = dict(old)
+    if now - old.get("ts_d", 0) > 3600:
+        px["d"], px["ts_d"] = yf(cfg["yf"], "1d", "2y"), now
+    if now - old.get("ts_i", 0) > 120:
+        px["m5"], px["m15"], px["ts_i"] = yf(cfg["yf"], "5m", "5d"), yf(cfg["yf"], "15m", "1mo"), now
+    return px
 
 
-# ----------------------------------------------------------------- snapshot (before vs now)
-def load_state():
-    try:
-        return json.loads(STATE.read_text())
-    except Exception:
-        return {}
+# --------------------------------------------------------------------- option chain
+def analyse_chain(j, hist_prev=None):
+    rec = j["records"]
+    spot = float(rec["underlyingValue"])
+    rows = rec["data"]
+
+    def rexp(r):  # v3 uses "expiryDates" on the row, legacy "expiryDate"; CE/PE legs carry it too
+        return (r.get("expiryDate") or r.get("expiryDates")
+                or (r.get("CE") or {}).get("expiryDate") or (r.get("PE") or {}).get("expiryDate")
+                or (rec.get("expiryDates") or ["NA"])[0])
+
+    def pdate(x):
+        for f in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d"):
+            try:
+                return dt.datetime.strptime(x, f)
+            except ValueError:
+                pass
+        return dt.datetime.max
+
+    ex = min({rexp(r) for r in rows}, key=pdate)
+    rows = sorted((r for r in rows if rexp(r) == ex), key=lambda r: r["strikePrice"])
+    K = np.array([r["strikePrice"] for r in rows], float)
+    g = lambda s, f: np.array([(r.get(s) or {}).get(f) or 0 for r in rows], float)
+    co, cc, cl = g("CE", "openInterest"), g("CE", "changeinOpenInterest"), g("CE", "lastPrice")
+    po, pc, pl = g("PE", "openInterest"), g("PE", "changeinOpenInterest"), g("PE", "lastPrice")
+    ia = int(abs(K - spot).argmin())
+    atm = int(K[ia])
+    near = slice(max(0, ia - 5), ia + 6)
+    pain = ((co[None, :] * np.maximum(K[:, None] - K[None, :], 0)).sum(1)
+            + (po[None, :] * np.maximum(K[None, :] - K[:, None], 0)).sum(1))
+
+    def walls(mask, o, ch, opp):
+        idx = np.where(mask)[0]
+        idx = idx[np.argsort(-o[idx])][:3]
+        return [dict(strike=int(K[i]), oi=float(o[i]), chg=float(ch[i]), ratio=float(o[i] / max(opp[i], 1)))
+                for i in idx]
+
+    sup, res = walls(K <= spot, po, pc, co), walls(K >= spot, co, cc, po)
+    lo, hi = max(0, ia - 8), ia + 9
+    bars = [dict(k=int(K[i]), ce=float(co[i]), pe=float(po[i])) for i in range(lo, min(hi, len(K)))]
+    pcr = po.sum() / max(co.sum(), 1)
+    pcr_atm = po[near].sum() / max(co[near].sum(), 1)
+    ce_d, pe_d = float(cc.sum()), float(pc.sum())
+    sc = 0
+    sc += 1 if pcr_atm > 1.1 else -1 if pcr_atm < 0.9 else 0
+    sc += 1 if pe_d > ce_d * 1.2 else -1 if ce_d > pe_d * 1.2 else 0
+    if sup and res:
+        sc += (sup[0]["chg"] > 0 and res[0]["chg"] < 0) - (res[0]["chg"] > 0 and sup[0]["chg"] < 0)
+    sc += 1 if spot > K[pain.argmin()] else -1
+    bias = "BULLISH" if sc >= 2 else "BEARISH" if sc <= -2 else "NEUTRAL"
+    return dict(spot=spot, atm=atm, expiry=ex, time=str(rec.get("timestamp", "")), pcr=round(pcr, 2),
+                pcr_atm=round(pcr_atm, 2), max_pain=int(K[pain.argmin()]),
+                straddle=round(float(cl[ia] + pl[ia]), 1), bias=bias, score=int(sc),
+                ce_d=ce_d, pe_d=pe_d, ce_tot=float(co.sum()), pe_tot=float(po.sum()),
+                sup=sup, res=res, bars=bars, iv_atm=None)
 
 
-def usable_prev(state, name):
-    p = state.get(name)
-    if not p:
-        return None, 0
-    age = time.time() - p.get("ts", 0)
-    same_day = p.get("date") == dt.datetime.now(IST).strftime("%Y-%m-%d")
-    return (p, max(1, round(age / 60))) if same_day and age <= STALE_AFTER else (None, 0)
+# --------------------------------------------------------------------- indicators
+def ema(x, n):
+    a, o = 2 / (n + 1), np.empty_like(x)
+    o[0] = x[0]
+    for i in range(1, len(x)):
+        o[i] = a * x[i] + (1 - a) * o[i - 1]
+    return o
 
 
-def snapshot(oc):
-    return dict(
-        ts=time.time(), date=dt.datetime.now(IST).strftime("%Y-%m-%d"), spot=oc["spot"],
-        pcr=oc["pcr"], ce_tot=oc["ce_tot"], pe_tot=oc["pe_tot"],
-        strikes={str(b["k"]): [b["ce"], b["pe"]] for b in oc["bars"]},
-        walls={f"{s}{w['strike']}": w["oi"] for s in ("sup", "res") for w in oc[s]},
-    )
+def swings(h, l, k):
+    hi, lo = [], []
+    for i in range(k, len(h) - k):
+        if h[i] == h[i - k:i + k + 1].max():
+            hi.append(i)
+        if l[i] == l[i - k:i + k + 1].min():
+            lo.append(i)
+    return np.array(hi, int), np.array(lo, int)
 
 
-# ----------------------------------------------------------------- chart
-def trendline(xs, ps, side, tol=0.0015):
-    """Best line through 2+ swing points: rising lows (sup) or falling highs (res)."""
+def best_trendline(xs, ps, side, nxt, tol):
+    """Line through 2+ swing points (ascending lows / descending highs), most touches then most recent."""
     pts, best = list(zip(xs[-8:], ps[-8:])), None
     for i in range(len(pts)):
         for j in range(i + 1, len(pts)):
@@ -146,390 +211,306 @@ def trendline(xs, ps, side, tol=0.0015):
             m = (y2 - y1) / (x2 - x1)
             t = sum(abs(y - (y1 + m * (x - x1))) <= tol * y for x, y in pts)
             if t >= 2 and (best is None or (t, x2) > (best[0], best[1])):
-                best = (t, x2, x1, y1, m)
+                best = (t, x2, y1 + m * (nxt - x1))
     return best
 
 
-def spread_labels(items, gap):
-    """items: [(y, text, color)] -> nudge y so labels don't overlap."""
-    items = sorted(items, key=lambda t: t[0])
-    out, last = [], -1e18
-    for y, txt, col in items:
-        yy = max(y, last + gap)
-        out.append((y, yy, txt, col))
-        last = yy
-    return out
+def anchored_vwap(b, i):
+    v = b["v"][i:] if b["v"].sum() > 0 else np.ones(len(b["c"]) - i)
+    tp = ((b["h"] + b["l"] + b["c"]) / 3)[i:]
+    return float((tp * v).sum() / v.sum())
 
 
-def make_chart(name, b, lv, oc, spot, chg):
-    o, h, l, c, day = b["o"], b["h"], b["l"], b["c"], b["day"]
-    n = len(c)
-    x = np.arange(n)
-    lo, hi = float(l.min()), float(h.max())
-
-    zones, lines = [], []   # zones: (price, color, label)   lines: (price, color, label)
-    if oc:
-        zones += [(w["strike"], RED, f"R {w['strike']:,}  {lk(w['oi'])}") for w in oc["res"]]
-        zones += [(w["strike"], GREEN, f"S {w['strike']:,}  {lk(w['oi'])}") for w in oc["sup"]]
-    if lv:
-        lines += [(lv["PDH"], "#5B6B8C", f"PDH {n0(lv['PDH'])}"), (lv["PDL"], "#5B6B8C", f"PDL {n0(lv['PDL'])}"),
-                  (lv["PWH"], "#8A94A6", f"PWH {n0(lv['PWH'])}"), (lv["PWL"], "#8A94A6", f"PWL {n0(lv['PWL'])}")]
-    near = lambda p: lo - 0.006 * spot <= p <= hi + 0.006 * spot
-    zones = [z for z in zones if near(z[0])]
-    lines = [z for z in lines if near(z[0])]
-    ys = [lo, hi] + [z[0] for z in zones + lines]
-    ylo, yhi = min(ys), max(ys)
-    pad = (yhi - ylo) * 0.06
-    ylo, yhi = ylo - pad, yhi + pad
-
-    fig, ax = plt.subplots(figsize=(7.4, 4.6), dpi=110)
-    fig.patch.set_facecolor(BG)
-    ax.set_facecolor(BG)
-
-    # resistance / support zones (bands like the reference chart)
-    bw = spot * 0.00035
-    labels = []
-    for p, col, lab in zones:
-        ax.axhspan(p - bw, p + bw, color=col, alpha=0.22, lw=0, zorder=1)
-        ax.axhline(p, color=col, lw=0.7, alpha=0.7, zorder=1)
-        labels.append((p, lab, col))
-    for p, col, lab in lines:
-        ax.axhline(p, color=col, lw=0.9, ls=(0, (4, 3)), alpha=0.9, zorder=1)
-        labels.append((p, lab, col))
-
-    # candles
-    colors = [UP if cc >= oo else DN for oo, cc in zip(o, c)]
-    ax.vlines(x, l, h, colors=colors, lw=0.8, zorder=3)
-    body = np.maximum(np.abs(c - o), spot * 0.00005)
-    ax.bar(x, body, bottom=np.minimum(o, c), width=0.68, color=colors, zorder=4)
-
-    # trendlines (15m swings over the 3 sessions)
-    xe = n + 1
-    ih, il = swings(h, l, 3)
-    for side, ix, arr, col, lab in (("sup", il, l, BLUE, "Trend sup"), ("res", ih, h, PURPLE, "Trend res")):
-        if len(ix) >= 2:
-            t = trendline(ix, arr[ix], side)
-            if t:
-                touches, x2, x1, y1, m = t
-                ax.plot([x1, xe], [y1 + m * (x1 - x1), y1 + m * (xe - x1)], color=col, lw=1.6, zorder=5)
-                py = y1 + m * (n - 1 - x1)
-                if ylo <= py <= yhi:
-                    labels.append((py, f"{lab} {n0(py)} ({touches}x)", col))
-
-    # day separators
-    starts = [0] + [i for i in range(1, n) if day[i] != day[i - 1]]
-    for s in starts:
-        if s:
-            ax.axvline(s - 0.5, color="#B8C2D4", lw=0.8, ls=":", zorder=0)
-    ax.set_xticks(starts)
-    ax.set_xticklabels([dt.date.fromordinal(int(day[s])).strftime("%d %b") for s in starts], fontsize=8, color=INK)
-
-    # spot marker
-    ax.axhline(spot, color=INK, lw=0.9, zorder=6)
-    ax.annotate(f" {n0(spot)} ", xy=(n + 0.4, spot), xycoords="data", fontsize=8, fontweight="bold",
-                color="white", va="center", ha="left", zorder=7,
-                bbox=dict(boxstyle="round,pad=0.25", fc=INK, ec="none"))
-
-    # right-hand labels (de-overlapped)
-    gap = (yhi - ylo) * 0.05
-    for y, yy, txt, col in spread_labels([(p, t, cl) for p, t, cl in labels if abs(p - spot) > gap * 0.4], gap):
-        ax.text(n + 0.4, yy, txt, fontsize=7.5, color=col, va="center", ha="left", fontweight="bold", zorder=7)
-
-    ax.set_xlim(-1, n + 15)
-    ax.set_ylim(ylo, yhi)
-    ax.yaxis.tick_left()
-    ax.tick_params(axis="y", labelsize=8, colors=INK, length=0)
-    ax.tick_params(axis="x", length=0)
-    ax.grid(axis="y", color="#DCE3EE", lw=0.5, zorder=0)
-    for s in ("top", "right", "left", "bottom"):
-        ax.spines[s].set_visible(False)
-    ax.set_title(f"{name}  {n0(spot)}  ({chg:+.2f}%)", loc="left", fontsize=11, fontweight="bold", color=INK)
-    ax.text(1.0, 1.015, "15m · last 3 sessions", transform=ax.transAxes, ha="right", fontsize=8, color="#5B6B8C")
-    fig.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    return buf.getvalue()
+def volume_profile(b, step):
+    lo, hi = b["l"].min(), b["h"].max()
+    edges = np.arange(math.floor(lo / step) * step, hi + step, step)
+    prof = np.zeros(len(edges))
+    tpo = b["v"].sum() == 0
+    for h, l, v in zip(b["h"], b["l"], b["v"]):
+        m = (edges >= l - step / 2) & (edges <= h + step / 2)
+        if m.any():
+            prof[m] += (1 if tpo else v) / m.sum()
+    sm = np.convolve(prof, [1, 1, 1], "same") / 3
+    mean = sm[sm > 0].mean()
+    hvn = [i for i in range(1, len(sm) - 1) if sm[i] >= sm[i - 1] and sm[i] >= sm[i + 1] and sm[i] > 1.2 * mean]
+    lvn = [i for i in range(1, len(sm) - 1) if sm[i] <= sm[i - 1] and sm[i] <= sm[i + 1] and 0 < sm[i] < 0.6 * mean]
+    hvn = sorted(hvn, key=lambda i: -sm[i])[:4]
+    return dict(poc=float(edges[sm.argmax()]), hvn=[float(edges[i]) for i in hvn],
+                lvn=[float(edges[i]) for i in lvn][:4], mode="TPO (index has no volume)" if tpo else "Volume")
 
 
-# ----------------------------------------------------------------- caption (under each chart)
-def walls_str(walls):
-    return " · ".join(f"{w['strike']:,} ({lk(w['oi'])})" for w in walls) or "n/a"
+def structure(h, l):
+    hi, lo = swings(h, l, 3)
+    if len(hi) < 2 or len(lo) < 2:
+        return "UNDEFINED"
+    hh, hl = h[hi[-1]] > h[hi[-2]], l[lo[-1]] > l[lo[-2]]
+    return ("UPTREND (HH-HL)" if hh and hl else "DOWNTREND (LH-LL)" if not hh and not hl
+            else "EXPANSION (HH-LL)" if hh else "CONTRACTION (LH-HL)")
 
 
-def caption(r, spot, chg):
-    name, oc, lv = r["name"], r["oc"], r["lv"]
-    L = [f"<b>{name}</b>  <b>{n0(spot)}</b>  {arrow(chg)}"]
-    if oc:
-        L.append(f"{BIAS_ICON.get(oc['bias'], '🟡')} {oc['bias']} · PCR {oc['pcr']} · Pain {oc['max_pain']:,} · Exp {oc['expiry']}")
-    if lv:
-        L.append(f"📅 PDH <b>{n0(lv['PDH'])}</b> · PDL <b>{n0(lv['PDL'])}</b> · PWH {n0(lv['PWH'])} · PWL {n0(lv['PWL'])}")
-        if lv["fib"]:
-            L.append("🌀 Fib " + " · ".join(f"{k} <b>{n0(v)}</b>" for k, v in lv["fib"].items()))
-        e = lv["ema"]
-        L.append(f"📉 EMA 20/50/200: {n0(e[20])} · {n0(e[50])} · {n0(e[200])}")
-    if oc:
-        L.append(f"🔴 Resist (call OI): {walls_str(oc['res'])}")
-        L.append(f"🟢 Support (put OI): {walls_str(oc['sup'])}")
-    else:
-        L.append("ℹ️ Option chain: n/a" + (" (BSE)" if name == "SENSEX" else " this run"))
-    return "\n".join(L)[:1000]
+# --------------------------------------------------------------------- confluence
+def build(oc, px, cfg, is_open):
+    spot, tol = oc["spot"], cfg["tol"]
+    C, LV = [], {}
+    near = lambda p: p and abs(p - spot) <= 0.04 * spot
 
+    def add(p, kind, label, w):
+        if near(p):
+            C.append((float(p), kind, label, w))
 
-# ----------------------------------------------------------------- text message (OI change)
-def oi_table(oc, prev):
-    bars = oc["bars"]
-    ia = next((i for i, b in enumerate(bars) if b["k"] == oc["atm"]), len(bars) // 2)
-    ps = (prev or {}).get("strikes", {})
-    out = [f"{'Strike':<7}{'CE L':>6}{'Δk':>8}{'PE L':>7}{'Δk':>8}"]
-    for b in bars[max(0, ia - 3): ia + 4]:
-        p = ps.get(str(b["k"]))
-        d1 = f"{(b['ce'] - p[0]) / 1e3:+.1f}" if p else "—"
-        d2 = f"{(b['pe'] - p[1]) / 1e3:+.1f}" if p else "—"
-        mark = "*" if b["k"] == oc["atm"] else " "
-        out.append(f"{str(b['k']) + mark:<7}{b['ce'] / 1e5:>6.1f}{d1:>8}{b['pe'] / 1e5:>7.1f}{d2:>8}")
-    return "<pre>" + html.escape("\n".join(out)) + "</pre>"
+    d, m5, m15 = px["d"], px["m5"], px["m15"]
+    today = dt.datetime.now(IST).date()
+    i = -2 if is_open and dt.datetime.fromtimestamp(d["t"][-1], IST).date() == today else -1
+    H, Lw, Cl = d["h"][i], d["l"][i], d["c"][i]
+    n = len(d["c"]) + i + 1
+    P = (H + Lw + Cl) / 3
+    rg = H - Lw
+    piv = dict(R3=H + 2 * (P - Lw), R2=P + rg, R1=2 * P - Lw, P=P, S1=2 * P - H, S2=P - rg, S3=Lw - 2 * (H - P))
+    cam = dict(R4=Cl + rg * 1.1 / 2, R3=Cl + rg * 1.1 / 4, C=Cl, S3=Cl - rg * 1.1 / 4, S4=Cl - rg * 1.1 / 2)
+    for k, v in piv.items():
+        add(v, "pivot", f"Pivot {k}", W["pivot"])
+    for k, v in cam.items():
+        if k != "C":
+            add(v, "pivot", f"Camarilla {k}", W["pivot"])
+    prev = dict(PDH=H, PDL=Lw, PWH=d["h"][max(0, n - 5):n].max(), PWL=d["l"][max(0, n - 5):n].min())
+    for k, v in prev.items():
+        add(v, "swing", k, W["swing"])
+    LV.update(pivot=piv, cam=cam, prev=prev)
 
+    # swings (daily + 15m)
+    dh, dl = swings(d["h"][-150:], d["l"][-150:], 4)
+    for ix in dh[-5:]:
+        add(d["h"][-150:][ix], "swing", "Daily swing high", W["swing"])
+    for ix in dl[-5:]:
+        add(d["l"][-150:][ix], "swing", "Daily swing low", W["swing"])
 
-def wall_changes(walls, prev, tag, mins, icon, label):
-    out = []
-    for n, w in enumerate(walls, 1):
-        before = (prev or {}).get("walls", {}).get(f"{tag}{w['strike']}")
-        step = f" · {mins}m <b>{kd(w['oi'] - before)}</b>" if before is not None else ""
-        out.append(f"{icon} {label}{n} <b>{w['strike']:,}</b> {lk(w['oi'])} · today {kd(w['chg'])}{step}")
-    return "\n".join(out)
+    # Fibonacci off latest daily swing
+    ih, il = swings(d["h"][-120:], d["l"][-120:], 5)
+    fib = {}
+    if len(ih) and len(il):
+        fh, fl = d["h"][-120:][ih[-1]], d["l"][-120:][il[-1]]
+        for r in (0.382, 0.5, 0.618):
+            fib[f"{r*100:g}%"] = fh - (fh - fl) * r if il[-1] < ih[-1] else fl + (fh - fl) * r
+            add(fib[f"{r*100:g}%"], "fib", f"Fib {r*100:g}%", W["fib"])
+    LV["fib"] = fib
 
+    # EMAs (daily)
+    em = {str(n_): float(ema(d["c"], n_)[-1]) for n_ in (20, 50, 200)}
+    for k, v in em.items():
+        add(v, "ema", f"EMA {k}", W["ema"])
+    LV["ema"] = em
 
-def explain(oc, lv, prev, mins):
-    s, sup, res = oc["spot"], oc["sup"], oc["res"]
-    L = []
-    if sup and res:
-        L.append(f"Range: put wall {sup[0]['strike']:,} (support) to call wall {res[0]['strike']:,} (resistance). "
-                 f"Expect chop inside the band; max pain {oc['max_pain']:,} tends to pull price into expiry.")
-    ce_d, pe_d = oc["ce_d"], oc["pe_d"]
-    if pe_d > ce_d * 1.2:
-        L.append(f"Today: put OI {kd(pe_d)} vs call {kd(ce_d)} - more put writing, supportive/bullish tilt.")
-    elif ce_d > pe_d * 1.2:
-        L.append(f"Today: call OI {kd(ce_d)} vs put {kd(pe_d)} - more call writing, upside capped/bearish tilt.")
-    else:
-        L.append(f"Today: call {kd(ce_d)} vs put {kd(pe_d)} - balanced writing, no clear side.")
-    if prev:
-        ds = s - prev["spot"]
-        dce, dpe = oc["ce_tot"] - prev["ce_tot"], oc["pe_tot"] - prev["pe_tot"]
-        if abs(ds) < 0.0003 * s:
-            ds = 0
-        hits = []
-        if ds > 0 and dce < 0:
-            hits.append("price up + call OI falling = short covering, upside momentum")
-        if ds > 0 and dpe > 0:
-            hits.append("price up + put OI rising = fresh put writing, support building")
-        if ds > 0 and dce > 0 and dpe <= 0:
-            hits.append("price up but call writers adding = rally being sold into")
-        if ds < 0 and dpe < 0:
-            hits.append("price down + put OI falling = long unwinding, support weakening")
-        if ds < 0 and dce > 0:
-            hits.append("price down + call OI rising = fresh call writing, sellers in control")
-        if ds < 0 and dpe > 0 and dce <= 0:
-            hits.append("dip being bought by put writers")
-        L.append(f"Last {mins}m (spot {ds:+.0f}): " + ("; ".join(hits[:2]) if hits else "no clear OI shift."))
-    if res:
-        r = res[0]
-        t = f"Resistance {r['strike']:,}: call OI {'rising - wall firm' if r['chg'] > 0 else 'falling - wall weakening'}"
-        t += f"; sustained break opens {res[1]['strike']:,}" if len(res) > 1 else ""
-        L.append(t + ".")
-    if sup:
-        x = sup[0]
-        t = f"Support {x['strike']:,}: put OI {'rising - floor firm' if x['chg'] > 0 else 'falling - floor weakening'}"
-        t += f"; breakdown opens {sup[1]['strike']:,}" if len(sup) > 1 else ""
-        L.append(t + ".")
-    pcr = oc["pcr"]
-    L.append(f"PCR {pcr}: " + ("above 1.5, crowded longs - reversal risk." if pcr > 1.5 else
-                              "above 1.2, put-heavy (supportive)." if pcr > 1.2 else
-                              "below 0.7, call-heavy - upside capped." if pcr < 0.7 else
-                              "below 0.9, call-leaning." if pcr < 0.9 else "neutral zone."))
-    e20 = lv["ema"][20] if lv else None
-    if e20:
-        ctx = f"Spot {'above' if s > e20 else 'below'} daily EMA20 ({n0(e20)})"
-        ctx += ", above PDH - intraday strength" if s > lv["PDH"] else ", below PDL - intraday weakness" if s < lv["PDL"] else ""
-        L.append(ctx + ".")
-    L.append(f"Net OI bias: {oc['bias']} (score {oc['score']:+d}). Rule-based reading, not advice.")
-    return "\n".join("• " + html.escape(x) for x in L)
+    # anchored VWAP (swing high / swing low / start of 5-day window)
+    av = dict(swing_high=anchored_vwap(m5, int(m5["h"].argmax())), swing_low=anchored_vwap(m5, int(m5["l"].argmin())),
+              week_start=anchored_vwap(m5, 0))
+    for k, v in av.items():
+        add(v, "avwap", f"AVWAP {k}", W["avwap"])
+    LV["avwap"] = av
 
+    # volume profile
+    vp = volume_profile(m5, cfg["bin"])
+    add(vp["poc"], "vp", "POC", W["vp"])
+    for v in vp["hvn"]:
+        add(v, "vp", "HVN", W["vp"])
+    LV["vp"] = vp
 
-def oi_block(r, prev, mins):
-    oc, lv, name = r["oc"], r["lv"], r["name"]
-    when = f"vs {mins}m ago" if prev else "first run today"
-    out = [f"{BIAS_ICON.get(oc['bias'], '🟡')} <b>{name}</b> · OI change <i>({when})</i>", oi_table(oc, prev)]
-    if prev:
-        dce, dpe = oc["ce_tot"] - prev["ce_tot"], oc["pe_tot"] - prev["pe_tot"]
-        out.append(f"🔴 Calls {lk(oc['ce_tot'])} <b>{kd(dce)}</b> · 🟢 Puts {lk(oc['pe_tot'])} <b>{kd(dpe)}</b> ({mins}m)")
-    out.append(f"📆 Today vs prev close: 🔴 calls <b>{kd(oc['ce_d'])}</b> · 🟢 puts <b>{kd(oc['pe_d'])}</b>")
-    out.append(wall_changes(oc["res"], prev, "res", mins, "🔴", "R"))
-    out.append(wall_changes(oc["sup"], prev, "sup", mins, "🟢", "S"))
-    out.append("<blockquote expandable><b>What it means</b>\n" + explain(oc, lv, prev, mins) + "</blockquote>")
-    return "\n".join(x for x in out if x)
+    # trendlines (daily 90 bars, 15m)
+    trend = []
+    for tf, b, k, lim in (("1D", d, 3, 90), ("15m", m15, 4, 300)):
+        h, l = b["h"][-lim:], b["l"][-lim:]
+        hi, lo = swings(h, l, k)
+        nxt = len(h)
+        for side, ix, arr in (("sup", lo, l), ("res", hi, h)):
+            if len(ix) >= 2:
+                t = best_trendline(ix, arr[ix], side, nxt, 0.0015)
+                if t and near(t[2]):
+                    trend.append(dict(name=f"{tf} {'rising' if side == 'sup' else 'falling'}", price=float(t[2]),
+                                      touches=int(t[0])))
+                    add(t[2], "trend", f"{tf} trendline ({t[0]} touches)", W["trend3"] if t[0] >= 3 else W["trend2"])
+    LV["trend"] = trend
 
+    # option-chain levels
+    for side in ("sup", "res"):
+        for w in oc[side]:
+            add(w["strike"], "oi", f"{'Put' if side == 'sup' else 'Call'} OI wall {w['strike']}", W["oi"])
+            if w["chg"] > 0:
+                add(w["strike"], "oichg", f"OI rising {w['strike']}", W["oichg"])
+    add(oc["max_pain"], "gann", "Max pain", 0)
 
-def header(results):
-    out = [f"🕒 <b>{dt.datetime.now(IST).strftime('%d %b %H:%M')} IST</b>"]
-    for r in results:
-        s = r["spot"]
-        out.append(f"<b>{r['name']}</b> {n0(s)} {arrow(r['chg'])}" if s is not None else f"<b>{r['name']}</b> n/a")
-    return "\n".join(out)
+    # Gann square of 9 (45 degree steps) - informational, no score
+    sq = math.sqrt(spot)
+    gann = [round((sq + k * 0.25) ** 2) for k in range(-6, 7) if k]
+    for g in gann:
+        add(g, "gann", "Gann 45°", 0)
+    LV["gann"] = gann
 
-
-def chunk(blocks):
-    msgs, cur = [], ""
-    for b in blocks:
-        if cur and len(cur) + len(b) + 2 > MAX_MSG:
-            msgs.append(cur)
-            cur = ""
-        cur = f"{cur}\n\n{b}" if cur else b
-    if cur:
-        msgs.append(cur)
-    return msgs
-
-
-def buttons():
-    row = [{"text": f"📈 {n}", "url": f"https://www.tradingview.com/chart/?symbol={s}"} for n, s in TV.items()]
-    return {"inline_keyboard": [[{"text": "📋 NSE Option Chain", "url": "https://www.nseindia.com/option-chain"}], row]}
-
-
-# ----------------------------------------------------------------- fetch
-def fetch(name):
-    r = dict(name=name, oc=None, lv=None, b=None, err=[], spot=None, chg=0.0)
-    try:
-        r["lv"] = daily_levels(yf(YF_SYM[name], "1d", "2y"))
-    except Exception as e:
-        r["err"].append(f"price: {e!r}")
-    try:
-        r["b"] = last_days(yf(YF_SYM[name], "15m", "5d"))
-    except Exception as e:
-        r["err"].append(f"15m: {e!r}")
-    if name in HAS_CHAIN:
-        try:
-            r["oc"] = analyse_chain(NSE().chain(name))
-        except Exception as e:
-            r["err"].append(f"NSE: {e!r}")
-    r["spot"] = r["oc"]["spot"] if r["oc"] else (r["lv"]["live"] if r["lv"] else None)
-    if r["spot"] is not None and r["lv"]:
-        r["chg"] = pct(r["spot"], r["lv"]["prev_close"])
-    return r
-
-
-# ----------------------------------------------------------------- telegram
-def plain(s):
-    return re.sub(r"<[^>]+>", "", html.unescape(s))
-
-
-def send_text(msg, markup, token, chat, hook):
-    payload = dict(text=msg, parse_mode="HTML", disable_web_page_preview=True)
-    if markup:
-        payload["reply_markup"] = markup
-    url, extra = (hook, {}) if hook else (f"https://api.telegram.org/bot{token}/sendMessage", dict(chat_id=chat))
-    r = requests.post(url, json={**payload, **extra}, timeout=30)
-    if r.status_code == 400:   # formatting rejected -> resend as plain text
-        payload.update(text=plain(msg))
-        payload.pop("parse_mode")
-        r = requests.post(url, json={**payload, **extra}, timeout=30)
-    if not r.ok:
-        raise RuntimeError(f"Telegram text {r.status_code}: {r.text[:300]}")
-
-
-def send_photos(photos, token, chat):
-    """photos: [(png_bytes, caption_html)] -> album (or single photo)."""
-    api = f"https://api.telegram.org/bot{token}/"
-    for as_html in (True, False):
-        caps = [c if as_html else plain(c) for _, c in photos]
-        if len(photos) == 1:
-            data = dict(chat_id=chat, caption=caps[0])
-            if as_html:
-                data["parse_mode"] = "HTML"
-            r = requests.post(api + "sendPhoto", data=data, files={"photo": ("chart.png", photos[0][0])}, timeout=60)
+    # cluster -> zones
+    C.sort()
+    clusters, cur = [], [C[0]]
+    for c in C[1:]:
+        if c[0] - cur[0][0] <= 2 * tol * spot:
+            cur.append(c)
         else:
-            media = []
-            for i, cap in enumerate(caps):
-                m = dict(type="photo", media=f"attach://p{i}", caption=cap)
-                if as_html:
-                    m["parse_mode"] = "HTML"
-                media.append(m)
-            r = requests.post(api + "sendMediaGroup", data=dict(chat_id=chat, media=json.dumps(media)),
-                              files={f"p{i}": (f"p{i}.png", png) for i, (png, _) in enumerate(photos)}, timeout=60)
-        if r.ok:
-            return
-        if r.status_code != 400:
-            break
-    raise RuntimeError(f"Telegram photo {r.status_code}: {r.text[:300]}")
-
-
-# ----------------------------------------------------------------- main
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--force", action="store_true")
-    ap.add_argument("--dry-run", action="store_true")
-    a = ap.parse_args()
-    if not a.force and not market_open():
-        print("Market closed - nothing sent.")
-        return 0
-
-    token, chat = os.getenv("TELEGRAM_BOT_TOKEN", ""), os.getenv("TELEGRAM_CHAT_ID", "")
-    hook = os.getenv("N8N_WEBHOOK_URL", "").strip()
-    if not a.dry_run and not hook and not (token and chat):
-        sys.exit("Set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (or N8N_WEBHOOK_URL)")
-
-    state = load_state()
-    with ThreadPoolExecutor(3) as ex:
-        results = list(ex.map(fetch, YF_SYM))
-    if not any(r["spot"] is not None for r in results):
-        print("No data from any source:", [r["err"] for r in results])
-        return 1
-
-    photos, text_blocks = [], [header(results)]
-    for r in results:
-        if r["spot"] is None:
-            text_blocks.append(f"⚠ <b>{r['name']}</b>: no data ({html.escape('; '.join(r['err']))})")
+            clusters.append(cur)
+            cur = [c]
+    clusters.append(cur)
+    sup_z, res_z = [], []
+    for cl in clusters:
+        kinds = {}
+        for p, k, lbl, w in cl:
+            k = "trend" if k == "trend" else k
+            if k not in kinds or w > kinds[k][0]:
+                kinds[k] = (w, lbl)
+        sc = sum(w for k, (w, _) in kinds.items() if k != "gann")
+        mid = float(np.mean([p for p, k, _, _ in cl if k != "gann"] or [cl[0][0]]))
+        side = "sup" if mid < spot else "res"
+        pcr_ok = oc["pcr"] >= 1.0 if side == "sup" else oc["pcr"] <= 0.8
+        if sc >= 2 and pcr_ok:
+            sc += W["pcr"]
+            kinds["pcr"] = (1, f"PCR {oc['pcr']}")
+        sc = min(sc, MAX_SCORE)
+        if sc < 3:
             continue
-        cap = caption(r, r["spot"], r["chg"])
-        png = None
-        if r["b"] is not None and len(r["b"]["c"]) > 5:
-            try:
-                png = make_chart(r["name"], r["b"], r["lv"], r["oc"], r["spot"], r["chg"])
-            except Exception as e:
-                print(f"chart {r['name']} failed: {e!r}")
-        if png:
-            photos.append((png, cap))
-            if a.dry_run:
-                Path("charts").mkdir(exist_ok=True)
-                Path(f"charts/{r['name']}.png").write_bytes(png)
-        else:
-            text_blocks.append(cap)           # chart failed -> caption goes into the text message
-        if r["oc"]:
-            prev, mins = usable_prev(state, r["name"])
-            text_blocks.append(oi_block(r, prev, mins))
-            state[r["name"]] = snapshot(r["oc"])
-        elif r["name"] in HAS_CHAIN:
-            text_blocks.append(f"⚠ <b>{r['name']}</b> option chain unavailable this run (NSE blocked/failed).")
+        z = dict(lo=min(p for p, *_ in cl), hi=max(p for p, *_ in cl), mid=mid, score=sc, grade=grade(sc),
+                 dist=(mid - spot) / spot * 100, tags=[l for _, (w, l) in kinds.items()])
+        (sup_z if side == "sup" else res_z).append(z)
+    sup_z = sorted(sup_z, key=lambda z: (-z["score"], -z["mid"]))[:5]
+    res_z = sorted(res_z, key=lambda z: (-z["score"], z["mid"]))[:5]
 
-    msgs = chunk(text_blocks)
-    if a.dry_run:
-        print("\n\n---- next message ----\n\n".join(msgs))
-        for _, c in photos:
-            print("\n[caption]\n" + c)
-        return 0
+    # signals
+    sig = []
+    for z, side in [(z, "sup") for z in sup_z[:2]] + [(z, "res") for z in res_z[:2]]:
+        if z["score"] >= 8 and abs(z["dist"]) <= 0.2:
+            sig.append(f"{'BUY' if side == 'sup' else 'SELL'} watch: at {side} zone {z['lo']:.0f}-{z['hi']:.0f} "
+                       f"({z['score']}/{MAX_SCORE} {z['grade']}) - wait for rejection candle, not a blind entry")
+    if spot > cam["R4"]:
+        sig.append("BUY breakout: spot above Camarilla R4")
+    elif spot < cam["S4"]:
+        sig.append("SELL breakdown: spot below Camarilla S4")
+    elif cam["S3"] < spot < cam["R3"]:
+        sig.append("Range day bias: spot between Camarilla S3 and R3")
+    if oc["pcr"] > 1.5:
+        sig.append("Caution: PCR > 1.5, crowded bullish positioning")
+    if oc["pcr"] < 0.7:
+        sig.append("Caution: PCR < 0.7, call-side dominance")
+    if abs(spot - oc["max_pain"]) / spot < 0.002:
+        sig.append(f"Pinning risk: spot near max pain {oc['max_pain']}")
+    if not sig:
+        sig.append("No high-confluence setup at spot - wait for price to reach a zone")
 
-    if photos:
-        if token and chat:
-            send_photos(photos, token, chat)
+    mid = [z["mid"] for z in sup_z + res_z]
+    return dict(zones_sup=sup_z, zones_res=res_z, levels=LV, structure=structure(d["h"][-120:], d["l"][-120:]),
+                signals=sig, price_time=dt.datetime.fromtimestamp(m5["t"][-1], IST).strftime("%d %b %H:%M"))
+
+
+# --------------------------------------------------------------------- engine + server
+class Engine:
+    def __init__(self):
+        self.data = {n: {} for n in SYMS}
+        self.hist = {n: deque(maxlen=14) for n in SYMS}
+        self.prev = {}
+        self.px = {n: {} for n in SYMS}
+        self.nse = {n: NSE() for n in SYMS}
+        self.next = time.time()
+        self.wake = threading.Event()
+
+    def one(self, n):
+        cfg = SYMS[n]
+        try:
+            oc = analyse_chain(self.nse[n].chain(n))
+        except Exception as e:
+            self.data[n] = {**self.data[n], "error": f"NSE: {e!r}"}
+            return
+        warn = ""
+        try:
+            self.px[n] = load_prices(cfg, self.px[n])
+        except Exception as e:
+            warn = f"price feed: {e!r}"
+        try:
+            adv = build(oc, self.px[n], cfg, market_open()) if "d" in self.px[n] else {}
+        except Exception as e:
+            adv, warn = {}, warn or f"analysis: {e!r}"
+        p = self.prev.get(n)
+        self.prev[n] = (oc["ce_tot"], oc["pe_tot"])
+        if p:
+            self.hist[n].appendleft(dict(t=dt.datetime.now(IST).strftime("%H:%M"), spot=oc["spot"], pcr=oc["pcr"],
+                                         ce=oc["ce_tot"] - p[0], pe=oc["pe_tot"] - p[1], bias=oc["bias"]))
+        sig = adv.pop("signals", []) if adv else []
+        self.data[n] = clean({**oc, **adv, "signals": sig, "history": list(self.hist[n]), "error": warn})
+
+    def cycle(self):
+        with ThreadPoolExecutor(len(SYMS)) as ex:
+            list(ex.map(self.one, SYMS))
+
+    def loop(self):
+        while True:
+            self.cycle()
+            iv = OPEN_REFRESH if market_open() else CLOSED_REFRESH
+            self.next = time.time() + iv
+            self.wake.wait(iv)
+            self.wake.clear()
+
+    def report(self):
+        out = []
+        for n, r in self.data.items():
+            if not r.get("spot"):
+                out.append(f"{n}: no data ({r.get('error')})")
+                continue
+            out += [f"== {n} {r['spot']} | exp {r['expiry']} | PCR {r['pcr']} | max pain {r['max_pain']} | "
+                    f"bias {r['bias']} | structure {r.get('structure', '-')}"]
+            for z in reversed(r.get("zones_res", [])):
+                out.append(f"  R {z['lo']:.0f}-{z['hi']:.0f}  {z['score']}/{MAX_SCORE} {z['grade']}: {', '.join(z['tags'])}")
+            out.append(f"  ---- spot {r['spot']}")
+            for z in r.get("zones_sup", []):
+                out.append(f"  S {z['lo']:.0f}-{z['hi']:.0f}  {z['score']}/{MAX_SCORE} {z['grade']}: {', '.join(z['tags'])}")
+            out += ["  " + s for s in r["signals"]]
+        return "\n".join(out)
+
+
+ENG = Engine()
+HTML = Path(__file__).with_name("index.html")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def send(self, body, ctype="application/json"):
+        b = body if isinstance(body, bytes) else body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Content-Length", str(len(b)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        p = self.path.split("?")[0]
+        if p == "/api/data":
+            self.send(json.dumps(ENG.data))
+        elif p == "/api/status":
+            self.send(json.dumps(dict(next=ENG.next, market_open=market_open())))
+        elif p == "/api/report":
+            self.send(ENG.report(), "text/plain")
+        elif p in ("/", "/index.html") and HTML.exists():
+            self.send(HTML.read_bytes(), "text/html")
         else:
-            print("No bot token/chat id - charts skipped (n8n route sends text only).")
-    for i, m in enumerate(msgs):
-        send_text(m, buttons() if i == len(msgs) - 1 else None, token, chat, hook)
-        time.sleep(1)
-    print(f"Sent {len(photos)} chart(s) + {len(msgs)} text message(s).")
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    STATE.write_text(json.dumps(state))
-    return 0
+            self.send_error(404)
+
+    def do_POST(self):
+        if self.path == "/api/fetch":
+            ENG.wake.set()
+            self.send("{}")
+        else:
+            self.send_error(404)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    if "--once" in sys.argv:
+        ENG.cycle()
+        print(ENG.report())
+    else:
+        port = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 8000
+        threading.Thread(target=ENG.loop, daemon=True).start()
+        print(f"Dashboard: http://127.0.0.1:{port}  (Ctrl+C to stop)")
+        ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
