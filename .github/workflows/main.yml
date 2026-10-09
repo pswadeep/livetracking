@@ -1,0 +1,57 @@
+name: NSE Telegram Alerts
+
+on:
+  schedule:
+    # NSE hours 09:15-15:30 IST = 03:45-10:00 UTC, Mon-Fri, every 5 min
+    - cron: "45,50,55 3 * * 1-5"
+    - cron: "*/5 4-9 * * 1-5"
+    - cron: "0 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Run even if the market is closed"
+        type: boolean
+        default: false
+
+concurrency:
+  group: nse-telegram
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # previous run's OI snapshot -> lets the message show "before vs now"
+      - name: Restore previous snapshot
+        uses: actions/cache/restore@v4
+        with:
+          path: state/snapshot.json
+          key: nse-snapshot-restore-only
+          restore-keys: nse-snapshot-
+
+      - name: Run engine and send Telegram message
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
+        run: python nse_telegram.py ${{ github.event.inputs.force == 'true' && '--force' || '' }}
+
+      - name: Save snapshot for next run
+        if: always() && hashFiles('state/snapshot.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state/snapshot.json
+          key: nse-snapshot-${{ github.run_id }}-${{ github.run_attempt }}
